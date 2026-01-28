@@ -9,6 +9,7 @@ import statistics
 import sys
 import tempfile
 import time
+import math
 from datetime import datetime, timezone
 
 try:
@@ -279,6 +280,356 @@ def bench_file_io(mb=64):
     return _timeit(lambda: _bench_native.file_io(mb), iters=3, progress_label="file_io")
 
 
+def bench_gpu_3d(frames=600, width=640, height=360):
+    try:
+        import pyglet
+        pyglet.options["debug_gl"] = False
+        pyglet.options["shadow_window"] = False
+        from pyglet import gl as _pyglet_gl
+    except Exception as exc:
+        return _bench_skip(f"pyglet unavailable: {exc}")
+
+    try:
+        window = pyglet.window.Window(
+            width=width,
+            height=height,
+            visible=False,
+            vsync=False,
+        )
+    except Exception as exc:
+        return _bench_skip(f"gpu window unavailable: {exc}")
+
+    gl = _pyglet_gl
+    gl_raw = getattr(_pyglet_gl, "gl", None)
+    glu = getattr(_pyglet_gl, "glu", None)
+
+    def _gl_attr(name):
+        if hasattr(gl, name):
+            return getattr(gl, name)
+        if gl_raw and hasattr(gl_raw, name):
+            return getattr(gl_raw, name)
+        return None
+
+    def _mat4_mul(a, b):
+        out = [0.0] * 16
+        for row in range(4):
+            r0 = row * 4
+            for col in range(4):
+                out[r0 + col] = (
+                    a[r0 + 0] * b[col + 0]
+                    + a[r0 + 1] * b[col + 4]
+                    + a[r0 + 2] * b[col + 8]
+                    + a[r0 + 3] * b[col + 12]
+                )
+        return out
+
+    def _mat4_perspective(fov_deg, aspect, z_near, z_far):
+        f = 1.0 / math.tan(math.radians(fov_deg) * 0.5)
+        return [
+            f / aspect, 0.0, 0.0, 0.0,
+            0.0, f, 0.0, 0.0,
+            0.0, 0.0, (z_far + z_near) / (z_near - z_far), -1.0,
+            0.0, 0.0, (2.0 * z_far * z_near) / (z_near - z_far), 0.0,
+        ]
+
+    def _mat4_translate(z):
+        return [
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            0.0, 0.0, z, 1.0,
+        ]
+
+    def _mat4_rotate_xyz(angle_deg):
+        a = math.radians(angle_deg)
+        c = math.cos(a)
+        s = math.sin(a)
+        return [
+            c, 0.0, s, 0.0,
+            s * 0.7, 1.0, -s * 0.2, 0.0,
+            -s, 0.0, c, 0.0,
+            0.0, 0.0, 0.0, 1.0,
+        ]
+
+    def _build_fixed_pipeline():
+        glViewport = _gl_attr("glViewport")
+        glMatrixMode = _gl_attr("glMatrixMode")
+        glLoadIdentity = _gl_attr("glLoadIdentity")
+        glEnable = _gl_attr("glEnable")
+        glClear = _gl_attr("glClear")
+        glTranslatef = _gl_attr("glTranslatef")
+        glRotatef = _gl_attr("glRotatef")
+        glFinish = _gl_attr("glFinish")
+        glBegin = _gl_attr("glBegin")
+        glEnd = _gl_attr("glEnd")
+        glColor3f = _gl_attr("glColor3f")
+        glVertex3f = _gl_attr("glVertex3f")
+        glFrustum = _gl_attr("glFrustum")
+        glProj = _gl_attr("GL_PROJECTION")
+        glModel = _gl_attr("GL_MODELVIEW")
+        glColor = _gl_attr("GL_COLOR_BUFFER_BIT")
+        glDepth = _gl_attr("GL_DEPTH_BUFFER_BIT")
+        glQuads = _gl_attr("GL_QUADS")
+        glDepthTest = _gl_attr("GL_DEPTH_TEST")
+        glCullFace = _gl_attr("GL_CULL_FACE")
+
+        required = {
+            "glViewport": glViewport,
+            "glMatrixMode": glMatrixMode,
+            "glLoadIdentity": glLoadIdentity,
+            "glEnable": glEnable,
+            "glClear": glClear,
+            "glTranslatef": glTranslatef,
+            "glRotatef": glRotatef,
+            "glFinish": glFinish,
+            "glBegin": glBegin,
+            "glEnd": glEnd,
+            "glColor3f": glColor3f,
+            "glVertex3f": glVertex3f,
+            "GL_PROJECTION": glProj,
+            "GL_MODELVIEW": glModel,
+            "GL_COLOR_BUFFER_BIT": glColor,
+            "GL_DEPTH_BUFFER_BIT": glDepth,
+            "GL_QUADS": glQuads,
+            "GL_DEPTH_TEST": glDepthTest,
+            "GL_CULL_FACE": glCullFace,
+        }
+        if not (glu and hasattr(glu, "gluPerspective")):
+            required["glFrustum"] = glFrustum
+        missing = [name for name, val in required.items() if val is None]
+        if missing:
+            return None, missing
+
+        glViewport(0, 0, width, height)
+        glMatrixMode(glProj)
+        glLoadIdentity()
+        if glu and hasattr(glu, "gluPerspective"):
+            glu.gluPerspective(60.0, width / float(height), 0.1, 100.0)
+        else:
+            aspect = width / float(height)
+            fov_rad = 60.0 * (3.141592653589793 / 180.0)
+            top = 0.1 * (fov_rad * 0.5)
+            right = top * aspect
+            glFrustum(-right, right, -top, top, 0.1, 100.0)
+        glMatrixMode(glModel)
+        glEnable(glDepthTest)
+        glEnable(glCullFace)
+
+        def run():
+            angle = 0.0
+            start = time.perf_counter()
+            for _ in range(frames):
+                window.dispatch_events()
+                glClear(glColor | glDepth)
+                glLoadIdentity()
+                glTranslatef(0.0, 0.0, -6.0)
+                glRotatef(angle, 1.0, 0.7, 0.2)
+                glBegin(glQuads)
+                # front
+                glColor3f(0.9, 0.2, 0.2)
+                glVertex3f(-1.0, -1.0, 1.0)
+                glVertex3f(1.0, -1.0, 1.0)
+                glVertex3f(1.0, 1.0, 1.0)
+                glVertex3f(-1.0, 1.0, 1.0)
+                # back
+                glColor3f(0.2, 0.9, 0.2)
+                glVertex3f(-1.0, -1.0, -1.0)
+                glVertex3f(-1.0, 1.0, -1.0)
+                glVertex3f(1.0, 1.0, -1.0)
+                glVertex3f(1.0, -1.0, -1.0)
+                # left
+                glColor3f(0.2, 0.2, 0.9)
+                glVertex3f(-1.0, -1.0, -1.0)
+                glVertex3f(-1.0, -1.0, 1.0)
+                glVertex3f(-1.0, 1.0, 1.0)
+                glVertex3f(-1.0, 1.0, -1.0)
+                # right
+                glColor3f(0.9, 0.9, 0.2)
+                glVertex3f(1.0, -1.0, -1.0)
+                glVertex3f(1.0, 1.0, -1.0)
+                glVertex3f(1.0, 1.0, 1.0)
+                glVertex3f(1.0, -1.0, 1.0)
+                # top
+                glColor3f(0.2, 0.9, 0.9)
+                glVertex3f(-1.0, 1.0, -1.0)
+                glVertex3f(-1.0, 1.0, 1.0)
+                glVertex3f(1.0, 1.0, 1.0)
+                glVertex3f(1.0, 1.0, -1.0)
+                # bottom
+                glColor3f(0.9, 0.2, 0.9)
+                glVertex3f(-1.0, -1.0, -1.0)
+                glVertex3f(1.0, -1.0, -1.0)
+                glVertex3f(1.0, -1.0, 1.0)
+                glVertex3f(-1.0, -1.0, 1.0)
+                glEnd()
+                window.flip()
+                glFinish()
+                angle = (angle + 1.3) % 360.0
+            elapsed = time.perf_counter() - start
+            if frames <= 0:
+                return 0.0
+            return elapsed / frames
+
+        return run, None
+
+    def _build_shader_pipeline():
+        try:
+            from pyglet.graphics.shader import Shader, ShaderProgram
+        except Exception as exc:
+            return None, f"shader init failed: {exc}"
+
+        vertex_src = """
+        #version 330
+        in vec3 position;
+        in vec3 color;
+        out vec3 v_color;
+        uniform mat4 mvp;
+        void main()
+        {
+            v_color = color;
+            gl_Position = mvp * vec4(position, 1.0);
+        }
+        """
+        fragment_src = """
+        #version 330
+        in vec3 v_color;
+        out vec4 out_color;
+        void main()
+        {
+            out_color = vec4(v_color, 1.0);
+        }
+        """
+        try:
+            program = ShaderProgram(
+                Shader(vertex_src, "vertex"),
+                Shader(fragment_src, "fragment"),
+            )
+        except Exception as exc:
+            return None, f"shader init failed: {exc}"
+
+        verts = [
+            # front
+            -1.0, -1.0, 1.0,
+            1.0, -1.0, 1.0,
+            1.0, 1.0, 1.0,
+            -1.0, -1.0, 1.0,
+            1.0, 1.0, 1.0,
+            -1.0, 1.0, 1.0,
+            # back
+            -1.0, -1.0, -1.0,
+            -1.0, 1.0, -1.0,
+            1.0, 1.0, -1.0,
+            -1.0, -1.0, -1.0,
+            1.0, 1.0, -1.0,
+            1.0, -1.0, -1.0,
+            # left
+            -1.0, -1.0, -1.0,
+            -1.0, -1.0, 1.0,
+            -1.0, 1.0, 1.0,
+            -1.0, -1.0, -1.0,
+            -1.0, 1.0, 1.0,
+            -1.0, 1.0, -1.0,
+            # right
+            1.0, -1.0, -1.0,
+            1.0, 1.0, -1.0,
+            1.0, 1.0, 1.0,
+            1.0, -1.0, -1.0,
+            1.0, 1.0, 1.0,
+            1.0, -1.0, 1.0,
+            # top
+            -1.0, 1.0, -1.0,
+            -1.0, 1.0, 1.0,
+            1.0, 1.0, 1.0,
+            -1.0, 1.0, -1.0,
+            1.0, 1.0, 1.0,
+            1.0, 1.0, -1.0,
+            # bottom
+            -1.0, -1.0, -1.0,
+            1.0, -1.0, -1.0,
+            1.0, -1.0, 1.0,
+            -1.0, -1.0, -1.0,
+            1.0, -1.0, 1.0,
+            -1.0, -1.0, 1.0,
+        ]
+        colors = []
+        face_colors = [
+            (0.9, 0.2, 0.2),
+            (0.2, 0.9, 0.2),
+            (0.2, 0.2, 0.9),
+            (0.9, 0.9, 0.2),
+            (0.2, 0.9, 0.9),
+            (0.9, 0.2, 0.9),
+        ]
+        for color in face_colors:
+            colors.extend(list(color) * 6)
+
+        try:
+            vlist = program.vertex_list(
+                36,
+                gl.GL_TRIANGLES,
+                position=("f", verts),
+                color=("f", colors),
+            )
+        except Exception as exc:
+            return None, f"shader init failed: {exc}"
+
+        glClear = _gl_attr("glClear")
+        glFinish = _gl_attr("glFinish")
+        glColor = _gl_attr("GL_COLOR_BUFFER_BIT")
+        glDepth = _gl_attr("GL_DEPTH_BUFFER_BIT")
+        glEnable = _gl_attr("glEnable")
+        glDepthTest = _gl_attr("GL_DEPTH_TEST")
+        glCullFace = _gl_attr("GL_CULL_FACE")
+        glViewport = _gl_attr("glViewport")
+
+        if None in (glClear, glFinish, glColor, glDepth, glEnable, glDepthTest, glCullFace, glViewport):
+            return None, "shader init failed: missing GL core functions"
+
+        glViewport(0, 0, width, height)
+        glEnable(glDepthTest)
+        glEnable(glCullFace)
+
+        def run():
+            angle = 0.0
+            start = time.perf_counter()
+            proj = _mat4_perspective(60.0, width / float(height), 0.1, 100.0)
+            view = _mat4_translate(-6.0)
+            for _ in range(frames):
+                window.dispatch_events()
+                glClear(glColor | glDepth)
+                model = _mat4_rotate_xyz(angle)
+                mvp = _mat4_mul(_mat4_mul(proj, view), model)
+                program["mvp"] = mvp
+                program.use()
+                vlist.draw(gl.GL_TRIANGLES)
+                window.flip()
+                glFinish()
+                angle = (angle + 1.3) % 360.0
+            elapsed = time.perf_counter() - start
+            if frames <= 0:
+                return 0.0
+            return elapsed / frames
+
+        return run, None
+
+    try:
+        window.switch_to()
+    except Exception as exc:
+        window.close()
+        return _bench_skip(f"gl init failed: {exc}")
+
+    run, err = _build_fixed_pipeline()
+    if run is None:
+        run, err = _build_shader_pipeline()
+        if run is None:
+            window.close()
+            return _bench_skip(f"gl init failed: {err}")
+
+    result = _timeit(run, iters=3, progress_label="gpu_3d")
+    window.close()
+    return result
+
+
 def run_benchmarks(args):
     benches = {
         "syscall_loop": lambda: bench_syscall_loop(n=args.syscall_iters),
@@ -289,10 +640,18 @@ def run_benchmarks(args):
         "thread_pingpong": lambda: bench_thread_pingpong(n=args.pingpong_iters),
         "mmap_touch": lambda: bench_mmap_touch(mb=args.mmap_mb),
         "file_io": lambda: bench_file_io(mb=args.io_mb),
+        "gpu_3d": lambda: bench_gpu_3d(
+            frames=args.gpu_frames, width=args.gpu_width, height=args.gpu_height
+        ),
     }
 
     if args.only:
-        benches = {k: v for k, v in benches.items() if k in args.only}
+        aliases = {
+            "gpu3d": "gpu_3d",
+            "gpu-3d": "gpu_3d",
+        }
+        only = [aliases.get(name, name) for name in args.only]
+        benches = {k: v for k, v in benches.items() if k in only}
 
     def run_once():
         out = {}
@@ -935,6 +1294,9 @@ def cmd_run(args):
             "pingpong_iters": args.pingpong_iters,
             "mmap_mb": args.mmap_mb,
             "io_mb": args.io_mb,
+            "gpu_frames": args.gpu_frames,
+            "gpu_width": args.gpu_width,
+            "gpu_height": args.gpu_height,
         },
     }
     path = _write_json_log(data, args.log_dir)
@@ -1064,6 +1426,9 @@ def build_parser():
     run.add_argument("--pingpong-iters", type=int, default=250_000)
     run.add_argument("--mmap-mb", type=int, default=64)
     run.add_argument("--io-mb", type=int, default=64)
+    run.add_argument("--gpu-frames", type=int, default=600)
+    run.add_argument("--gpu-width", type=int, default=640)
+    run.add_argument("--gpu-height", type=int, default=360)
     run.add_argument("--repeat", type=int, default=3, help="Repeat full suite and median-aggregate")
     run.add_argument("--only", nargs="+", help="Run only specific benchmarks")
     run.set_defaults(func=cmd_run)

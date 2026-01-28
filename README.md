@@ -27,6 +27,11 @@ Run a single benchmark:
 ```bash
 ./run.sh --only syscall_loop
 ```
+GPU benchmark alias examples:
+```bash
+./run.sh --only gpu_3d
+./run.sh --only gpu3d
+```
 
 Compare two runs by id/path:
 ```bash
@@ -69,6 +74,14 @@ The following benchmarks run in Cython when the extension is built:
 - `thread_pingpong`
 
 The Cython extension is required to run benchmarks.
+
+Optional GPU benchmark:
+- `gpu_3d` (requires `pyglet` and a working OpenGL context; skipped if unavailable)
+
+Install the optional dependency:
+```bash
+python3 -m pip install pyglet
+```
 
 To build manually:
 ```bash
