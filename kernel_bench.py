@@ -16,6 +16,11 @@ import tempfile
 import time
 from datetime import datetime, timezone
 
+try:
+    import bench_native as _bench_native
+except Exception:
+    _bench_native = None
+
 
 LOG_DIR_DEFAULT = "bench_logs"
 DATA_STORE_DEFAULT = "data_store"
@@ -190,6 +195,9 @@ def _libc():
 
 
 def bench_syscall_loop(n=1_500_000):
+    if _bench_native:
+        return _timeit(lambda: _bench_native.syscall_loop(n), iters=5)
+
     def run():
         for _ in range(n):
             os.getpid()
@@ -201,9 +209,15 @@ def bench_stat_loop(n=400_000):
     path = tmp.name
     tmp.close()
 
-    def run():
-        for _ in range(n):
-            os.stat(path)
+    if _bench_native:
+        path_bytes = path.encode()
+
+        def run():
+            return _bench_native.stat_loop(path_bytes, n)
+    else:
+        def run():
+            for _ in range(n):
+                os.stat(path)
     result = _timeit(run, iters=5)
     os.unlink(path)
     return result
@@ -441,6 +455,32 @@ def _aggregate_runs(runs):
     return {"benchmarks": out}
 
 
+def _bench_config_key(data):
+    cfg = data.get("bench_config") or {}
+    if not isinstance(cfg, dict):
+        return ()
+    return tuple(sorted(cfg.items()))
+
+
+def _filter_matching_configs(a_runs, b_runs):
+    a_by_cfg = {}
+    b_by_cfg = {}
+    for r in a_runs:
+        a_by_cfg.setdefault(_bench_config_key(r), []).append(r)
+    for r in b_runs:
+        b_by_cfg.setdefault(_bench_config_key(r), []).append(r)
+
+    shared = [cfg for cfg in a_by_cfg.keys() if cfg in b_by_cfg]
+    if not shared:
+        return a_runs, b_runs, None, None
+
+    def score(cfg):
+        return len(a_by_cfg[cfg]) + len(b_by_cfg[cfg])
+
+    best = max(shared, key=score)
+    return a_by_cfg[best], b_by_cfg[best], best, shared
+
+
 def _filter_outlier_runs(runs, z_thresh=3.5, min_benchmarks=3, min_runs=4):
     if len(runs) < min_runs:
         return runs, [], {}
@@ -461,6 +501,11 @@ def _filter_outlier_runs(runs, z_thresh=3.5, min_benchmarks=3, min_runs=4):
     }
     if not bench_medians:
         return runs, [], {}
+    bench_mads = {
+        name: statistics.median([abs(v - bench_medians[name]) for v in vals])
+        for name, vals in bench_vals.items()
+        if len(vals) >= 2
+    }
 
     run_scales = []
     for data in runs:
@@ -493,11 +538,27 @@ def _filter_outlier_runs(runs, z_thresh=3.5, min_benchmarks=3, min_runs=4):
     outliers = []
     outlier_ids = []
     for data, scale in run_scales:
-        if scale is None:
-            kept.append(data)
-            continue
-        z = 0.6745 * (scale - med) / mad
-        if abs(z) > z_thresh:
+        bench_outlier = False
+        normalized = _normalize_benchmarks(data.get("benchmarks"))
+        for name, entry in normalized.items():
+            val = entry.get("p50_s")
+            if val is None:
+                continue
+            bmad = bench_mads.get(name) or 0
+            if bmad == 0:
+                continue
+            bz = 0.6745 * (val - bench_medians[name]) / bmad
+            if abs(bz) > z_thresh:
+                bench_outlier = True
+                break
+
+        scale_outlier = False
+        if scale is not None:
+            z = 0.6745 * (scale - med) / mad
+            if abs(z) > z_thresh:
+                scale_outlier = True
+
+        if bench_outlier or scale_outlier:
             outliers.append(data)
             outlier_ids.append(data.get("run_id"))
         else:
@@ -509,11 +570,13 @@ def _filter_outlier_runs(runs, z_thresh=3.5, min_benchmarks=3, min_runs=4):
         "outlier_min_benchmarks": min_benchmarks,
         "outlier_median_scale": med,
         "outlier_mad_scale": mad,
+        "outlier_mode": "scale_or_benchmark",
     }
     return kept, outliers, info
 
 
 def _compare_groups(a_runs, b_runs):
+    a_runs, b_runs, cfg_used, cfg_candidates = _filter_matching_configs(a_runs, b_runs)
     a_kept, a_outliers, a_info = _filter_outlier_runs(a_runs)
     b_kept, b_outliers, b_info = _filter_outlier_runs(b_runs)
     a_agg = _aggregate_runs(a_kept)
@@ -530,6 +593,8 @@ def _compare_groups(a_runs, b_runs):
         "comparison_outliers": [r.get("run_id") for r in b_outliers],
         "baseline_outlier_info": a_info,
         "comparison_outlier_info": b_info,
+        "bench_config_used": dict(cfg_used) if cfg_used else None,
+        "bench_config_candidates": [dict(c) for c in (cfg_candidates or [])],
         "baseline_kernel": base_kernel.get("kernel_release") if a_kept else None,
         "comparison_kernel": comp_kernel.get("kernel_release") if b_kept else None,
         "baseline_kind": _classify_kernel(base_kernel) if a_kept else None,
@@ -640,6 +705,12 @@ def _print_human_report(report):
             f"winner={winner}; B slower in {slower}/{total}, faster in {faster}/{total}, "
             f"median delta {_format_delta(med)}"
         )
+        cfg = summary.get("bench_config_used")
+        if cfg:
+            print(f"bench config: {cfg}")
+        cfgs = summary.get("bench_config_candidates") or []
+        if cfgs and len(cfgs) > 1:
+            print(f"bench config note: {len(cfgs)} shared configs; using the most common")
         out_a = summary.get("baseline_outliers") or []
         out_b = summary.get("comparison_outliers") or []
         if out_a or out_b:
@@ -771,8 +842,13 @@ def _auto_compare(log_dir):
 
 
 def cmd_run(args):
+    global _bench_native
+    if args.no_cython:
+        _bench_native = None
+    start = time.monotonic()
     kernel_info = collect_kernel_info()
     benchmarks = run_benchmarks(args)
+    elapsed = time.monotonic() - start
     data = {
         "run_id": _run_id(),
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
@@ -791,6 +867,7 @@ def cmd_run(args):
     path = _write_json_log(data, args.log_dir)
     print(f"saved: {path}")
     print(f"run_id: {data['run_id']}")
+    print(f"elapsed: {elapsed:.2f}s")
     _auto_compare(args.log_dir)
 
 
@@ -905,6 +982,7 @@ def build_parser():
     run.add_argument("--io-mb", type=int, default=64)
     run.add_argument("--repeat", type=int, default=3, help="Repeat full suite and median-aggregate")
     run.add_argument("--only", nargs="+", help="Run only specific benchmarks")
+    run.add_argument("--no-cython", action="store_true", help="Force pure-Python benchmarks")
     run.set_defaults(func=cmd_run)
 
     lst = sub.add_parser("list", help="List existing runs")
