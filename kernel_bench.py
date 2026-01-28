@@ -189,73 +189,6 @@ def _libc():
     return ctypes.CDLL("libc.so.6", use_errno=True)
 
 
-def _install_seccomp_allow_all():
-    if platform.system() != "Linux":
-        raise OSError(errno.ENOSYS, "seccomp only supported on Linux")
-    if not hasattr(os, "SYS_seccomp"):
-        raise OSError(errno.ENOSYS, "seccomp syscall not available")
-
-    libc = _libc()
-    PR_SET_NO_NEW_PRIVS = 38
-    SECCOMP_SET_MODE_FILTER = 1
-    SECCOMP_FILTER_FLAG_TSYNC = 0
-    SECCOMP_RET_ALLOW = 0x7fff0000
-    BPF_RET = 0x06
-    BPF_K = 0x00
-
-    class SockFilter(ctypes.Structure):
-        _fields_ = [
-            ("code", ctypes.c_ushort),
-            ("jt", ctypes.c_ubyte),
-            ("jf", ctypes.c_ubyte),
-            ("k", ctypes.c_uint32),
-        ]
-
-    class SockFprog(ctypes.Structure):
-        _fields_ = [
-            ("len", ctypes.c_ushort),
-            ("filter", ctypes.POINTER(SockFilter)),
-        ]
-
-    filt = SockFilter(code=BPF_RET | BPF_K, jt=0, jf=0, k=SECCOMP_RET_ALLOW)
-    prog = SockFprog(len=1, filter=ctypes.pointer(filt))
-
-    if libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
-        raise OSError(ctypes.get_errno(), "prctl(PR_SET_NO_NEW_PRIVS) failed")
-    res = libc.syscall(os.SYS_seccomp, SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_TSYNC, ctypes.byref(prog))
-    if res != 0:
-        raise OSError(ctypes.get_errno(), "seccomp filter install failed")
-
-
-def _seccomp_child_syscall_loop(n):
-    rfd, wfd = os.pipe()
-    pid = os.fork()
-    if pid == 0:
-        try:
-            os.close(rfd)
-            _install_seccomp_allow_all()
-            t0 = time.perf_counter()
-            for _ in range(n):
-                os.getpid()
-            t1 = time.perf_counter()
-            os.write(wfd, struct.pack("d", t1 - t0))
-        except BaseException:
-            pass
-        finally:
-            try:
-                os.close(wfd)
-            except OSError:
-                pass
-            os._exit(0)
-    os.close(wfd)
-    data = os.read(rfd, 8)
-    os.close(rfd)
-    os.waitpid(pid, 0)
-    if len(data) != 8:
-        raise RuntimeError("seccomp child failed")
-    return struct.unpack("d", data)[0]
-
-
 def bench_syscall_loop(n=1_500_000):
     def run():
         for _ in range(n):
@@ -417,6 +350,8 @@ def _compare_runs(a, b):
         b_entry = b["benchmarks"][name]
         a_med = a_entry.get("p50_s")
         b_med = b_entry.get("p50_s")
+        if a_med is None and b_med is None:
+            continue
         if a_med is None or b_med is None or a_med == 0:
             delta = None
         else:
@@ -470,11 +405,15 @@ def _build_report(a, b):
     a_bench = _normalize_benchmarks(a.get("benchmarks"))
     b_bench = _normalize_benchmarks(b.get("benchmarks"))
     report = _compare_runs({"benchmarks": a_bench}, {"benchmarks": b_bench})
+    base_kernel = a.get("kernel") or {}
+    comp_kernel = b.get("kernel") or {}
     report["summary"] = {
         "baseline_run_id": a.get("run_id"),
         "comparison_run_id": b.get("run_id"),
-        "baseline_kernel": (a.get("kernel") or {}).get("kernel_release"),
-        "comparison_kernel": (b.get("kernel") or {}).get("kernel_release"),
+        "baseline_kernel": base_kernel.get("kernel_release"),
+        "comparison_kernel": comp_kernel.get("kernel_release"),
+        "baseline_kind": _classify_kernel(base_kernel),
+        "comparison_kind": _classify_kernel(comp_kernel),
         "baseline_repeat": a.get("bench_repeat"),
         "comparison_repeat": b.get("bench_repeat"),
         "generated_utc": datetime.now(timezone.utc).isoformat(),
@@ -502,15 +441,99 @@ def _aggregate_runs(runs):
     return {"benchmarks": out}
 
 
+def _filter_outlier_runs(runs, z_thresh=3.5, min_benchmarks=3, min_runs=4):
+    if len(runs) < min_runs:
+        return runs, [], {}
+
+    bench_vals = {}
+    for data in runs:
+        normalized = _normalize_benchmarks(data.get("benchmarks"))
+        for name, entry in normalized.items():
+            val = entry.get("p50_s")
+            if val is None:
+                continue
+            bench_vals.setdefault(name, []).append(val)
+
+    bench_medians = {
+        name: statistics.median(vals)
+        for name, vals in bench_vals.items()
+        if len(vals) >= 2
+    }
+    if not bench_medians:
+        return runs, [], {}
+
+    run_scales = []
+    for data in runs:
+        ratios = []
+        for name, med in bench_medians.items():
+            if not med:
+                continue
+            entry = _normalize_benchmarks(data.get("benchmarks")).get(name)
+            if not entry:
+                continue
+            val = entry.get("p50_s")
+            if val is None:
+                continue
+            ratios.append(val / med)
+        if len(ratios) < min_benchmarks:
+            run_scales.append((data, None))
+        else:
+            run_scales.append((data, statistics.median(ratios)))
+
+    scales = [scale for _, scale in run_scales if scale is not None]
+    if len(scales) < min_runs:
+        return runs, [], {}
+
+    med = statistics.median(scales)
+    mad = statistics.median([abs(s - med) for s in scales])
+    if mad == 0:
+        return runs, [], {}
+
+    kept = []
+    outliers = []
+    outlier_ids = []
+    for data, scale in run_scales:
+        if scale is None:
+            kept.append(data)
+            continue
+        z = 0.6745 * (scale - med) / mad
+        if abs(z) > z_thresh:
+            outliers.append(data)
+            outlier_ids.append(data.get("run_id"))
+        else:
+            kept.append(data)
+
+    info = {
+        "outlier_run_ids": outlier_ids,
+        "outlier_threshold": z_thresh,
+        "outlier_min_benchmarks": min_benchmarks,
+        "outlier_median_scale": med,
+        "outlier_mad_scale": mad,
+    }
+    return kept, outliers, info
+
+
 def _compare_groups(a_runs, b_runs):
-    a_agg = _aggregate_runs(a_runs)
-    b_agg = _aggregate_runs(b_runs)
+    a_kept, a_outliers, a_info = _filter_outlier_runs(a_runs)
+    b_kept, b_outliers, b_info = _filter_outlier_runs(b_runs)
+    a_agg = _aggregate_runs(a_kept)
+    b_agg = _aggregate_runs(b_kept)
     report = _compare_runs(a_agg, b_agg)
+    base_kernel = (a_kept[-1].get("kernel") or {}) if a_kept else {}
+    comp_kernel = (b_kept[-1].get("kernel") or {}) if b_kept else {}
     report["summary"] = {
-        "baseline_runs": [r.get("run_id") for r in a_runs],
-        "comparison_runs": [r.get("run_id") for r in b_runs],
-        "baseline_kernel": (a_runs[-1].get("kernel") or {}).get("kernel_release") if a_runs else None,
-        "comparison_kernel": (b_runs[-1].get("kernel") or {}).get("kernel_release") if b_runs else None,
+        "baseline_runs": [r.get("run_id") for r in a_kept],
+        "comparison_runs": [r.get("run_id") for r in b_kept],
+        "baseline_runs_all": [r.get("run_id") for r in a_runs],
+        "comparison_runs_all": [r.get("run_id") for r in b_runs],
+        "baseline_outliers": [r.get("run_id") for r in a_outliers],
+        "comparison_outliers": [r.get("run_id") for r in b_outliers],
+        "baseline_outlier_info": a_info,
+        "comparison_outlier_info": b_info,
+        "baseline_kernel": base_kernel.get("kernel_release") if a_kept else None,
+        "comparison_kernel": comp_kernel.get("kernel_release") if b_kept else None,
+        "baseline_kind": _classify_kernel(base_kernel) if a_kept else None,
+        "comparison_kind": _classify_kernel(comp_kernel) if b_kept else None,
         "generated_utc": datetime.now(timezone.utc).isoformat(),
     }
     return report
@@ -575,7 +598,10 @@ def _print_human_report(report):
                 pass
         rows.append((name, base, comp, delta))
 
-    headers = ("benchmark", "baseline", "comparison", "delta")
+    summary = report.get("summary", {})
+    base_label = summary.get("baseline_kind") or "baseline"
+    comp_label = summary.get("comparison_kind") or "comparison"
+    headers = ("benchmark", base_label, comp_label, "delta")
     col_widths = [
         max(len(headers[0]), *(len(r[0]) for r in rows)) if rows else len(headers[0]),
         max(len(headers[1]), *(len(r[1]) for r in rows)) if rows else len(headers[1]),
@@ -614,6 +640,10 @@ def _print_human_report(report):
             f"winner={winner}; B slower in {slower}/{total}, faster in {faster}/{total}, "
             f"median delta {_format_delta(med)}"
         )
+        out_a = summary.get("baseline_outliers") or []
+        out_b = summary.get("comparison_outliers") or []
+        if out_a or out_b:
+            print(f"filtered outliers: A={len(out_a)} B={len(out_b)}")
     print(fmt_row(headers))
     print(
         f"{'-' * col_widths[0]}  "
@@ -807,6 +837,58 @@ def cmd_compare(args):
         )
 
 
+def cmd_prune_logs(args):
+    if not os.path.isdir(args.log_dir):
+        print("no logs")
+        return
+    entries = []
+    for name in os.listdir(args.log_dir):
+        if not name.endswith(".json"):
+            continue
+        path = os.path.join(args.log_dir, name)
+        try:
+            data = _load_run(path)
+        except json.JSONDecodeError:
+            continue
+        kind = _classify_run(data) or "unknown"
+        entries.append((kind, data, path))
+
+    buckets = {}
+    for kind, data, path in entries:
+        if kind == "unknown" and not args.include_unknown:
+            continue
+        buckets.setdefault(kind, []).append((data, path))
+
+    total_outliers = 0
+    for kind, items in sorted(buckets.items()):
+        runs = [d for d, _ in items]
+        kept, outliers, info = _filter_outlier_runs(
+            runs,
+            z_thresh=args.z_thresh,
+            min_benchmarks=args.min_benchmarks,
+            min_runs=args.min_runs,
+        )
+        outlier_ids = set(info.get("outlier_run_ids") or [])
+        outlier_paths = [p for d, p in items if d.get("run_id") in outlier_ids]
+        total_outliers += len(outlier_paths)
+        if not outlier_paths:
+            print(f"{kind}: no outliers")
+            continue
+        if args.apply:
+            for path in outlier_paths:
+                try:
+                    os.remove(path)
+                    print(f"{kind}: removed {path}")
+                except OSError as exc:
+                    print(f"{kind}: failed to remove {path}: {exc}", file=sys.stderr)
+        else:
+            for path in outlier_paths:
+                print(f"{kind}: would remove {path}")
+
+    if not args.apply:
+        print(f"dry run: {total_outliers} outlier logs identified (no files removed)")
+
+
 def build_parser():
     p = argparse.ArgumentParser(
         description="Benchmark kernel performance and detect hardening signals."
@@ -833,6 +915,24 @@ def build_parser():
     cmp.add_argument("comparison", help="Comparison run_id or JSON path")
     cmp.set_defaults(func=cmd_compare)
 
+    prune = sub.add_parser(
+        "prune",
+        help="Prune outlier run logs",
+        description=(
+            "Detect outlier runs within each kernel kind (normal/hardened) and optionally delete them.\n"
+            "By default this is a dry run and only prints which logs would be removed.\n"
+            "Examples:\n"
+            "  python kernel_bench.py prune\n"
+            "  python kernel_bench.py prune --apply\n"
+        ),
+    )
+    prune.add_argument("--z-thresh", type=float, default=3.5)
+    prune.add_argument("--min-benchmarks", type=int, default=3)
+    prune.add_argument("--min-runs", type=int, default=4)
+    prune.add_argument("--include-unknown", action="store_true", help="Also prune runs with unknown kernel kind")
+    prune.add_argument("--apply", action="store_true", help="Actually remove outlier logs (default: dry run)")
+    prune.set_defaults(func=cmd_prune_logs)
+
     return p
 
 
@@ -841,7 +941,7 @@ def main():
     argv = sys.argv[1:]
     if argv and argv[0] == "run":
         print("warning: 'run' is the default subcommand; you can omit it", file=sys.stderr)
-    if not argv or (argv and argv[0] not in {"run", "list", "compare"} and "--help" not in argv and "-h" not in argv):
+    if not argv or (argv and argv[0] not in {"run", "list", "compare", "prune"} and "--help" not in argv and "-h" not in argv):
         argv = ["run"] + argv
     args, unknown = parser.parse_known_args(argv)
     if unknown:
