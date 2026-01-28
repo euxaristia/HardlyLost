@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 
 
 LOG_DIR_DEFAULT = "bench_logs"
+DATA_STORE_DEFAULT = "data_store"
 
 
 def _read_text(path):
@@ -317,124 +318,6 @@ def bench_thread_pingpong(n=200_000):
     return result
 
 
-def bench_seccomp_syscall_loop(n=1_000_000):
-    if platform.system() != "Linux":
-        return _bench_skip("seccomp bench requires Linux")
-    if not hasattr(os, "SYS_seccomp"):
-        return _bench_skip("seccomp syscall not available")
-
-    def run():
-        return _seccomp_child_syscall_loop(n)
-
-    try:
-        return _timeit(run, iters=3, progress_label="seccomp_syscall_loop")
-    except OSError as exc:
-        return _bench_skip(f"seccomp setup failed: {exc}")
-    except RuntimeError as exc:
-        return _bench_skip(str(exc))
-
-
-def bench_perf_event_open(n=50_000):
-    if platform.system() != "Linux":
-        return _bench_skip("perf_event bench requires Linux")
-    if not hasattr(os, "SYS_perf_event_open"):
-        return _bench_skip("perf_event_open syscall not available")
-
-    libc = _libc()
-    libc.syscall.restype = ctypes.c_long
-
-    PERF_TYPE_SOFTWARE = 1
-    PERF_COUNT_SW_CPU_CLOCK = 0
-
-    class PerfEventAttr(ctypes.Structure):
-        _fields_ = [
-            ("type", ctypes.c_uint32),
-            ("size", ctypes.c_uint32),
-            ("config", ctypes.c_uint64),
-            ("sample_period", ctypes.c_uint64),
-            ("sample_type", ctypes.c_uint64),
-            ("read_format", ctypes.c_uint64),
-            ("flags", ctypes.c_uint64),
-            ("wakeup_events", ctypes.c_uint32),
-            ("bp_type", ctypes.c_uint32),
-            ("bp_addr", ctypes.c_uint64),
-        ]
-
-    attr = PerfEventAttr()
-    attr.type = PERF_TYPE_SOFTWARE
-    attr.size = ctypes.sizeof(PerfEventAttr)
-    attr.config = PERF_COUNT_SW_CPU_CLOCK
-
-    def run():
-        for _ in range(n):
-            fd = libc.syscall(os.SYS_perf_event_open, ctypes.byref(attr), 0, -1, -1, 0)
-            if fd < 0:
-                err = ctypes.get_errno()
-                raise OSError(err, os.strerror(err))
-            os.close(fd)
-
-    try:
-        return _timeit(run, iters=2)
-    except OSError as exc:
-        if exc.errno in (errno.EPERM, errno.EACCES, errno.ENOSYS):
-            return _bench_skip(f"perf_event_open blocked: {exc}")
-        return _bench_skip(f"perf_event_open failed: {exc}")
-
-
-def bench_bpf_map_create(n=5_000):
-    if platform.system() != "Linux":
-        return _bench_skip("BPF bench requires Linux")
-    if not hasattr(os, "SYS_bpf"):
-        return _bench_skip("bpf syscall not available")
-
-    libc = _libc()
-    libc.syscall.restype = ctypes.c_long
-
-    BPF_MAP_CREATE = 0
-    BPF_MAP_TYPE_ARRAY = 2
-    BPF_OBJ_NAME_LEN = 16
-
-    class BpfAttrMapCreate(ctypes.Structure):
-        _fields_ = [
-            ("map_type", ctypes.c_uint32),
-            ("key_size", ctypes.c_uint32),
-            ("value_size", ctypes.c_uint32),
-            ("max_entries", ctypes.c_uint32),
-            ("map_flags", ctypes.c_uint32),
-            ("inner_map_fd", ctypes.c_uint32),
-            ("numa_node", ctypes.c_uint32),
-            ("map_name", ctypes.c_char * BPF_OBJ_NAME_LEN),
-            ("map_ifindex", ctypes.c_uint32),
-            ("btf_fd", ctypes.c_uint32),
-            ("btf_key_type_id", ctypes.c_uint32),
-            ("btf_value_type_id", ctypes.c_uint32),
-            ("btf_vmlinux_value_type_id", ctypes.c_uint32),
-            ("map_extra", ctypes.c_uint64),
-        ]
-
-    attr = BpfAttrMapCreate()
-    attr.map_type = BPF_MAP_TYPE_ARRAY
-    attr.key_size = 4
-    attr.value_size = 8
-    attr.max_entries = 1
-    attr.map_name = b"hb_bench\0"
-
-    def run():
-        for _ in range(n):
-            fd = libc.syscall(os.SYS_bpf, BPF_MAP_CREATE, ctypes.byref(attr), ctypes.sizeof(attr))
-            if fd < 0:
-                err = ctypes.get_errno()
-                raise OSError(err, os.strerror(err))
-            os.close(fd)
-
-    try:
-        return _timeit(run, iters=2)
-    except OSError as exc:
-        if exc.errno in (errno.EPERM, errno.EACCES, errno.ENOSYS, errno.EINVAL):
-            return _bench_skip(f"BPF map create blocked: {exc}")
-        return _bench_skip(f"BPF map create failed: {exc}")
-
-
 def bench_mmap_touch(mb=64):
     import mmap
 
@@ -477,9 +360,6 @@ def run_benchmarks(args):
         "stat_loop": lambda: bench_stat_loop(n=args.stat_iters),
         "fork_exec": lambda: bench_fork_exec(n=args.fork_iters),
         "thread_pingpong": lambda: bench_thread_pingpong(n=args.pingpong_iters),
-        "seccomp_syscall_loop": lambda: bench_seccomp_syscall_loop(n=args.seccomp_iters),
-        "perf_event_open": lambda: bench_perf_event_open(n=args.perf_iters),
-        "bpf_map_create": lambda: bench_bpf_map_create(n=args.bpf_iters),
         "mmap_touch": lambda: bench_mmap_touch(mb=args.mmap_mb),
         "file_io": lambda: bench_file_io(mb=args.io_mb),
     }
@@ -544,15 +424,158 @@ def _compare_runs(a, b):
     return out
 
 
-def _classify_label(label):
-    if not label:
-        return None
-    lowered = label.lower()
-    if any(k in lowered for k in ("harden", "hardening", "lockdown", "secure", "grsec", "pax")):
-        return "hardened"
-    if any(k in lowered for k in ("normal", "standard", "vanilla", "stock", "default")):
-        return "normal"
-    return None
+def _build_report(a, b):
+    report = _compare_runs(a, b)
+    report["summary"] = {
+        "baseline_run_id": a.get("run_id"),
+        "comparison_run_id": b.get("run_id"),
+        "baseline_kernel": (a.get("kernel") or {}).get("kernel_release"),
+        "comparison_kernel": (b.get("kernel") or {}).get("kernel_release"),
+        "generated_utc": datetime.now(timezone.utc).isoformat(),
+    }
+    return report
+
+
+def _aggregate_runs(runs):
+    benches = {}
+    for data in runs:
+        for name, entry in (data.get("benchmarks") or {}).items():
+            benches.setdefault(name, []).append(entry)
+
+    out = {}
+    for name, entries in benches.items():
+        vals = [e.get("p50_s") for e in entries if e.get("p50_s") is not None]
+        entry = {}
+        if vals:
+            entry["p50_s"] = statistics.median(vals)
+        skipped = [e.get("skipped") for e in entries if e.get("skipped")]
+        if skipped:
+            entry["skipped"] = skipped[0]
+        out[name] = entry
+    return {"benchmarks": out}
+
+
+def _compare_groups(a_runs, b_runs):
+    a_agg = _aggregate_runs(a_runs)
+    b_agg = _aggregate_runs(b_runs)
+    report = _compare_runs(a_agg, b_agg)
+    report["summary"] = {
+        "baseline_runs": [r.get("run_id") for r in a_runs],
+        "comparison_runs": [r.get("run_id") for r in b_runs],
+        "baseline_kernel": (a_runs[-1].get("kernel") or {}).get("kernel_release") if a_runs else None,
+        "comparison_kernel": (b_runs[-1].get("kernel") or {}).get("kernel_release") if b_runs else None,
+        "generated_utc": datetime.now(timezone.utc).isoformat(),
+    }
+    return report
+
+
+def _format_seconds(value):
+    if value is None:
+        return "n/a"
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return "n/a"
+    if v >= 1.0:
+        return f"{v:.3f}s"
+    if v >= 1e-3:
+        return f"{v * 1e3:.2f}ms"
+    if v >= 1e-6:
+        return f"{v * 1e6:.1f}us"
+    return f"{v * 1e9:.1f}ns"
+
+
+def _format_delta(value):
+    if value is None:
+        return "n/a"
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return "n/a"
+    return f"{v:+.1f}%"
+
+
+def _write_report_json(report, data_store_dir, name_hint):
+    if not data_store_dir:
+        return None, "data store path not set"
+    try:
+        os.makedirs(data_store_dir, exist_ok=True)
+    except OSError as exc:
+        return None, f"mkdir failed: {exc}"
+    path = os.path.join(data_store_dir, f"{name_hint}.json")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(report, f, indent=2, sort_keys=True)
+    except OSError as exc:
+        return None, f"write failed: {exc}"
+    return path, None
+
+
+def _print_human_report(report):
+    benches = report.get("benchmarks", {})
+    rows = []
+    deltas = []
+    for name in sorted(benches.keys()):
+        entry = benches[name]
+        base = _format_seconds(entry.get("baseline_p50_s"))
+        comp = _format_seconds(entry.get("comparison_p50_s"))
+        delta = _format_delta(entry.get("delta_percent"))
+        raw_delta = entry.get("delta_percent")
+        if raw_delta is not None:
+            try:
+                deltas.append(float(raw_delta))
+            except (TypeError, ValueError):
+                pass
+        rows.append((name, base, comp, delta))
+
+    headers = ("benchmark", "baseline", "comparison", "delta")
+    col_widths = [
+        max(len(headers[0]), *(len(r[0]) for r in rows)) if rows else len(headers[0]),
+        max(len(headers[1]), *(len(r[1]) for r in rows)) if rows else len(headers[1]),
+        max(len(headers[2]), *(len(r[2]) for r in rows)) if rows else len(headers[2]),
+        max(len(headers[3]), *(len(r[3]) for r in rows)) if rows else len(headers[3]),
+    ]
+
+    def fmt_row(r):
+        return (
+            f"{r[0]:<{col_widths[0]}}  "
+            f"{r[1]:>{col_widths[1]}}  "
+            f"{r[2]:>{col_widths[2]}}  "
+            f"{r[3]:>{col_widths[3]}}"
+        )
+
+    if deltas:
+        slower = sum(1 for d in deltas if d > 0)
+        faster = sum(1 for d in deltas if d < 0)
+        total = len(deltas)
+        med = statistics.median(deltas)
+        summary = report.get("summary", {})
+        base_name = summary.get("baseline_kernel") or "baseline"
+        comp_name = summary.get("comparison_kernel") or "comparison"
+        if summary.get("baseline_runs") is not None:
+            base_name = f"{base_name} ({len(summary.get('baseline_runs') or [])} runs)"
+        if summary.get("comparison_runs") is not None:
+            comp_name = f"{comp_name} ({len(summary.get('comparison_runs') or [])} runs)"
+        if med > 0:
+            winner = "A"
+        elif med < 0:
+            winner = "B"
+        else:
+            winner = "tie"
+        print(
+            f"overall: A={base_name} B={comp_name} -> "
+            f"winner={winner}; B slower in {slower}/{total}, faster in {faster}/{total}, "
+            f"median delta {_format_delta(med)}"
+        )
+    print(fmt_row(headers))
+    print(
+        f"{'-' * col_widths[0]}  "
+        f"{'-' * col_widths[1]}  "
+        f"{'-' * col_widths[2]}  "
+        f"{'-' * col_widths[3]}"
+    )
+    for name, base, comp, delta in rows:
+        print(fmt_row((name, base, comp, delta)))
 
 
 def _classify_kernel(kernel_info):
@@ -565,6 +588,46 @@ def _classify_kernel(kernel_info):
         return "hardened"
     if any(k in tokens for k in ("vanilla", "stock", "default")):
         return "normal"
+    if tokens.strip():
+        return "normal"
+    return None
+
+
+def _classify_run(data):
+    kernel_info = data.get("kernel") or {}
+    kind = _classify_kernel(kernel_info)
+    if kind:
+        return kind
+
+    indicators = set(kernel_info.get("hardening_indicators", {}).get("indicators") or [])
+    score = kernel_info.get("hardening_indicators", {}).get("score")
+    lockdown = kernel_info.get("lockdown") or ""
+    has_lockdown = "lockdown" in indicators or (lockdown and "none" not in lockdown)
+
+    config_enabled = sum(1 for k in indicators if k.startswith("CONFIG_"))
+    mitigations = 0
+    for item in indicators:
+        if item.startswith("mitigations:"):
+            try:
+                mitigations = int(item.split(":", 1)[1])
+            except ValueError:
+                mitigations = 0
+            break
+
+    # Heuristics: lockdown or consistently high hardening signals => hardened.
+    if has_lockdown:
+        return "hardened"
+    if score is not None and score >= 10:
+        return "hardened"
+    if config_enabled >= 8 and mitigations >= 8:
+        return "hardened"
+
+    # Low signal set usually indicates a normal/stock kernel.
+    if score is not None and score <= 4:
+        return "normal"
+    if config_enabled <= 3 and mitigations <= 3:
+        return "normal"
+
     return None
 
 
@@ -580,8 +643,7 @@ def _auto_compare(log_dir):
             data = _load_run(path)
         except json.JSONDecodeError:
             continue
-        label = data.get("label")
-        kind = _classify_label(label) or _classify_kernel(data.get("kernel"))
+        kind = _classify_run(data)
         ts = data.get("timestamp_utc")
         runs.append((ts, kind, data, path))
 
@@ -600,23 +662,35 @@ def _auto_compare(log_dir):
                     return datetime.fromtimestamp(0, timezone.utc)
         return max(candidates, key=key)
 
-    normal = pick_latest("normal")
-    hardened = pick_latest("hardened")
+    normal = [r for r in runs if r[1] == "normal"]
+    hardened = [r for r in runs if r[1] == "hardened"]
 
     if not normal or not hardened:
         missing = "hardened" if not hardened else "normal"
         print(
             f"auto-compare: need both normal and hardened runs. "
-            f"Please boot a {missing} kernel and rerun with --label {missing}."
+            f"Could not infer a {missing} run from the logs; "
+            f"make sure you have runs from both kernels."
         )
         return
 
-    report = _compare_runs(normal[2], hardened[2])
+    normal_runs = [r[2] for r in normal]
+    hardened_runs = [r[2] for r in hardened]
+    report = _compare_groups(normal_runs, hardened_runs)
     print(
-        f"auto-compare: baseline(normal)={normal[2].get('run_id')} "
-        f"comparison(hardened)={hardened[2].get('run_id')}"
+        f"auto-compare: normal_runs={len(normal_runs)} "
+        f"hardened_runs={len(hardened_runs)}"
     )
-    print(json.dumps(report, indent=2, sort_keys=True))
+    _print_human_report(report)
+    name_hint = f"compare_{len(normal_runs)}n_{len(hardened_runs)}h"
+    path, err = _write_report_json(report, DATA_STORE_DEFAULT, name_hint)
+    if path:
+        print(f"saved report: {path}")
+    else:
+        print(
+            f"warning: could not write report to {DATA_STORE_DEFAULT} ({err})",
+            file=sys.stderr,
+        )
 
 
 def cmd_run(args):
@@ -625,7 +699,6 @@ def cmd_run(args):
     data = {
         "run_id": _run_id(),
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-        "label": args.label,
         "kernel": kernel_info,
         "benchmarks": benchmarks,
         "bench_config": {
@@ -633,9 +706,6 @@ def cmd_run(args):
             "stat_iters": args.stat_iters,
             "fork_iters": args.fork_iters,
             "pingpong_iters": args.pingpong_iters,
-            "seccomp_iters": args.seccomp_iters,
-            "perf_iters": args.perf_iters,
-            "bpf_iters": args.bpf_iters,
             "mmap_mb": args.mmap_mb,
             "io_mb": args.io_mb,
         },
@@ -657,7 +727,8 @@ def cmd_list(args):
         path = os.path.join(args.log_dir, name)
         try:
             data = _load_run(path)
-            entries.append((data.get("timestamp_utc"), data.get("run_id"), data.get("label"), path))
+            kind = _classify_run(data)
+            entries.append((data.get("timestamp_utc"), data.get("run_id"), kind, path))
         except json.JSONDecodeError:
             continue
     for ts, run_id, label, path in sorted(entries):
@@ -675,8 +746,17 @@ def cmd_compare(args):
         sys.exit(1)
     a = _load_run(a_path)
     b = _load_run(b_path)
-    report = _compare_runs(a, b)
-    print(json.dumps(report, indent=2, sort_keys=True))
+    report = _build_report(a, b)
+    _print_human_report(report)
+    name_hint = f"compare_{a.get('run_id')}_{b.get('run_id')}"
+    path, err = _write_report_json(report, DATA_STORE_DEFAULT, name_hint)
+    if path:
+        print(f"saved report: {path}")
+    else:
+        print(
+            f"warning: could not write report to {DATA_STORE_DEFAULT} ({err})",
+            file=sys.stderr,
+        )
 
 
 def build_parser():
@@ -687,14 +767,10 @@ def build_parser():
     sub = p.add_subparsers(dest="cmd", required=True)
 
     run = sub.add_parser("run", help="Run benchmarks and record kernel info")
-    run.add_argument("--label", help="Label for the run (e.g., standard, hardened)")
     run.add_argument("--syscall-iters", type=int, default=1_000_000)
     run.add_argument("--stat-iters", type=int, default=300_000)
     run.add_argument("--fork-iters", type=int, default=300)
     run.add_argument("--pingpong-iters", type=int, default=200_000)
-    run.add_argument("--seccomp-iters", type=int, default=1_000_000)
-    run.add_argument("--perf-iters", type=int, default=50_000)
-    run.add_argument("--bpf-iters", type=int, default=5_000)
     run.add_argument("--mmap-mb", type=int, default=64)
     run.add_argument("--io-mb", type=int, default=64)
     run.add_argument("--only", nargs="+", help="Run only specific benchmarks")
