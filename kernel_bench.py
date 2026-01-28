@@ -223,6 +223,22 @@ def bench_syscall_loop(n=1_500_000):
     return _timeit(lambda: _bench_native.syscall_loop(n), iters=5, progress_label="syscall_loop")
 
 
+def bench_pure_loop(n=1_500_000):
+    if not _bench_native:
+        raise RuntimeError("bench_native is required (build with setup.py)")
+    return _timeit(lambda: _bench_native.pure_loop(n), iters=5, progress_label="pure_loop")
+
+
+def bench_syscall_minus_loop(n=1_500_000):
+    if not _bench_native:
+        raise RuntimeError("bench_native is required (build with setup.py)")
+    return _timeit(
+        lambda: _bench_native.syscall_loop(n) - _bench_native.pure_loop(n),
+        iters=5,
+        progress_label="syscall_minus_loop",
+    )
+
+
 def bench_stat_loop(n=400_000):
     tmp = tempfile.NamedTemporaryFile(delete=False)
     path = tmp.name
@@ -266,6 +282,8 @@ def bench_file_io(mb=64):
 def run_benchmarks(args):
     benches = {
         "syscall_loop": lambda: bench_syscall_loop(n=args.syscall_iters),
+        "pure_loop": lambda: bench_pure_loop(n=args.syscall_iters),
+        "syscall_minus_loop": lambda: bench_syscall_minus_loop(n=args.syscall_iters),
         "stat_loop": lambda: bench_stat_loop(n=args.stat_iters),
         "fork_exec": lambda: bench_fork_exec(n=args.fork_iters),
         "thread_pingpong": lambda: bench_thread_pingpong(n=args.pingpong_iters),
@@ -688,6 +706,98 @@ def _print_human_report(report):
         print(fmt_row((name, base, comp, delta)))
 
 
+def _print_single_run_table(benchmarks):
+    if not benchmarks:
+        return
+    rows = []
+    has_notes = False
+    if isinstance(benchmarks, dict):
+        for name in sorted(benchmarks.keys()):
+            entry = benchmarks[name] or {}
+            note = entry.get("skipped")
+            if note:
+                has_notes = True
+            rows.append(
+                (
+                    name,
+                    _format_seconds(entry.get("p50_s")),
+                    _format_seconds(entry.get("min_s")),
+                    _format_seconds(entry.get("max_s")),
+                    str(note) if note else "",
+                )
+            )
+    elif isinstance(benchmarks, list):
+        names = set()
+        for run in benchmarks:
+            if isinstance(run, dict):
+                names.update(run.keys())
+        for name in sorted(names):
+            entries = [
+                run.get(name)
+                for run in benchmarks
+                if isinstance(run, dict) and run.get(name)
+            ]
+            p50s = [e.get("p50_s") for e in entries if e.get("p50_s") is not None]
+            note = next((e.get("skipped") for e in entries if e.get("skipped")), "")
+            if note:
+                has_notes = True
+            if p50s:
+                med = statistics.median(p50s)
+                mn = min(p50s)
+                mx = max(p50s)
+            else:
+                med = mn = mx = None
+            rows.append(
+                (
+                    name,
+                    _format_seconds(med),
+                    _format_seconds(mn),
+                    _format_seconds(mx),
+                    str(note) if note else "",
+                )
+            )
+
+    if not rows:
+        return
+
+    headers = ("benchmark", "p50", "min", "max", "note")
+    col_widths = [
+        max(len(headers[0]), *(len(r[0]) for r in rows)),
+        max(len(headers[1]), *(len(r[1]) for r in rows)),
+        max(len(headers[2]), *(len(r[2]) for r in rows)),
+        max(len(headers[3]), *(len(r[3]) for r in rows)),
+    ]
+    if has_notes:
+        col_widths.append(max(len(headers[4]), *(len(r[4]) for r in rows)))
+
+    def fmt_row(r):
+        base = (
+            f"{r[0]:<{col_widths[0]}}  "
+            f"{r[1]:>{col_widths[1]}}  "
+            f"{r[2]:>{col_widths[2]}}  "
+            f"{r[3]:>{col_widths[3]}}"
+        )
+        if has_notes:
+            return f"{base}  {r[4]:<{col_widths[4]}}"
+        return base
+
+    header = headers[:4] if not has_notes else headers
+    print(fmt_row(header))
+    print(
+        f"{'-' * col_widths[0]}  "
+        f"{'-' * col_widths[1]}  "
+        f"{'-' * col_widths[2]}  "
+        f"{'-' * col_widths[3]}",
+        end="",
+    )
+    if has_notes:
+        print(f"  {'-' * col_widths[4]}")
+    else:
+        print()
+    for row in rows:
+        print(fmt_row(row))
+
+
 def _classify_kernel(kernel_info):
     if not kernel_info:
         return None
@@ -831,6 +941,7 @@ def cmd_run(args):
     print(f"saved: {path}")
     print(f"run_id: {data['run_id']}")
     print(f"elapsed: {elapsed:.2f}s")
+    _print_single_run_table(benchmarks)
     _auto_compare(args.log_dir, impl)
 
 

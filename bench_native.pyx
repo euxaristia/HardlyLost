@@ -20,7 +20,7 @@ cdef extern from "unistd.h":
     ssize_t read(int fd, void *buf, size_t count)
     ssize_t write(int fd, const void *buf, size_t count)
 
-cdef extern from "time.h":
+cdef extern from "time.h" nogil:
     ctypedef long time_t
 
     cdef struct timespec:
@@ -85,7 +85,7 @@ cdef extern from "errno.h":
 cdef int SEEK_SET = 0
 
 
-cdef inline double _now():
+cdef inline double _now() nogil:
     cdef timespec ts
     clock_gettime(CLOCK_MONOTONIC, &ts)
     return ts.tv_sec + ts.tv_nsec / 1e9
@@ -96,6 +96,17 @@ def syscall_loop(int n):
     cdef double t0 = _now()
     for i in range(n):
         getpid()
+    return _now() - t0
+
+
+def pure_loop(int n):
+    cdef int i
+    cdef long acc = 0
+    cdef double t0 = _now()
+    for i in range(n):
+        acc += i
+    if acc == -1:
+        return -1.0
     return _now() - t0
 
 
@@ -232,7 +243,7 @@ cdef void* _pingpong_worker(void *arg) noexcept nogil:
     return NULL
 
 
-def thread_pingpong(int n):
+cdef double _thread_pingpong_nogil(int n) nogil:
     cdef pingpong_state st
     cdef pthread_t thr
     cdef int i
@@ -272,4 +283,11 @@ def thread_pingpong(int n):
     pthread_cond_destroy(&st.cond_worker)
     pthread_cond_destroy(&st.cond_main)
     pthread_mutex_destroy(&st.mutex)
+    return t0
+
+
+def thread_pingpong(int n):
+    cdef double t0
+    with nogil:
+        t0 = _thread_pingpong_nogil(n)
     return t0
