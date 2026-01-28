@@ -9,6 +9,8 @@ extensions = [
     Extension(
         "bench_native",
         ["bench_native.pyx"],
+        extra_compile_args=["-pthread"],
+        extra_link_args=["-pthread"],
     )
 ]
 

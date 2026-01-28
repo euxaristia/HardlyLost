@@ -57,6 +57,16 @@ def _read_kernel_config():
     return None
 
 
+def _current_bench_impl(args=None):
+    if args is not None and getattr(args, "no_cython", False):
+        return "python"
+    return "cython" if _bench_native else "python"
+
+
+def _bench_impl_of(data):
+    return (data or {}).get("bench_impl")
+
+
 def _config_enabled(config_text, key):
     if not config_text:
         return None
@@ -196,12 +206,12 @@ def _libc():
 
 def bench_syscall_loop(n=1_500_000):
     if _bench_native:
-        return _timeit(lambda: _bench_native.syscall_loop(n), iters=5)
+        return _timeit(lambda: _bench_native.syscall_loop(n), iters=5, progress_label="syscall_loop")
 
     def run():
         for _ in range(n):
             os.getpid()
-    return _timeit(run, iters=5)
+    return _timeit(run, iters=5, progress_label="syscall_loop")
 
 
 def bench_stat_loop(n=400_000):
@@ -218,23 +228,26 @@ def bench_stat_loop(n=400_000):
         def run():
             for _ in range(n):
                 os.stat(path)
-    result = _timeit(run, iters=5)
+    result = _timeit(run, iters=5, progress_label="stat_loop")
     os.unlink(path)
     return result
 
 
 def bench_fork_exec(n=400):
     if _bench_native:
-        return _timeit(lambda: _bench_native.fork_exec(n), iters=5)
+        return _timeit(lambda: _bench_native.fork_exec(n), iters=5, progress_label="fork_exec")
 
     def run():
         for _ in range(n):
             subprocess.run(["/bin/true"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return _timeit(run, iters=5)
+    return _timeit(run, iters=5, progress_label="fork_exec")
 
 
 def bench_thread_pingpong(n=250_000):
     import threading
+
+    if _bench_native:
+        return _timeit(lambda: _bench_native.thread_pingpong(n), iters=5, progress_label="thread_pingpong")
 
     e1 = threading.Event()
     e2 = threading.Event()
@@ -270,7 +283,7 @@ def bench_thread_pingpong(n=250_000):
 
 def bench_mmap_touch(mb=64):
     if _bench_native:
-        return _timeit(lambda: _bench_native.mmap_touch(mb), iters=3)
+        return _timeit(lambda: _bench_native.mmap_touch(mb), iters=3, progress_label="mmap_touch")
 
     import mmap
 
@@ -283,14 +296,14 @@ def bench_mmap_touch(mb=64):
             step = 4096
             for i in range(0, size, step):
                 mm[i:i+1] = b"\x01"
-        result = _timeit(run, iters=3)
+        result = _timeit(run, iters=3, progress_label="mmap_touch")
         mm.close()
     return result
 
 
 def bench_file_io(mb=64):
     if _bench_native:
-        return _timeit(lambda: _bench_native.file_io(mb), iters=3)
+        return _timeit(lambda: _bench_native.file_io(mb), iters=3, progress_label="file_io")
 
     size = mb * 1024 * 1024
     data = os.urandom(1024 * 1024)
@@ -307,7 +320,7 @@ def bench_file_io(mb=64):
                 pass
         os.unlink(fname)
 
-    return _timeit(run, iters=3)
+    return _timeit(run, iters=3, progress_label="file_io")
 
 
 def run_benchmarks(args):
@@ -788,7 +801,7 @@ def _classify_run(data):
     return None
 
 
-def _auto_compare(log_dir):
+def _auto_compare(log_dir, impl):
     if not os.path.isdir(log_dir):
         return
     runs = []
@@ -799,6 +812,8 @@ def _auto_compare(log_dir):
         try:
             data = _load_run(path)
         except json.JSONDecodeError:
+            continue
+        if _bench_impl_of(data) != impl:
             continue
         kind = _classify_run(data)
         ts = data.get("timestamp_utc")
@@ -854,6 +869,7 @@ def cmd_run(args):
     global _bench_native
     if args.no_cython:
         _bench_native = None
+    impl = _current_bench_impl(args)
     start = time.monotonic()
     kernel_info = collect_kernel_info()
     benchmarks = run_benchmarks(args)
@@ -861,6 +877,7 @@ def cmd_run(args):
     data = {
         "run_id": _run_id(),
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "bench_impl": impl,
         "kernel": kernel_info,
         "benchmarks": benchmarks,
         "bench_repeat": args.repeat,
@@ -877,13 +894,14 @@ def cmd_run(args):
     print(f"saved: {path}")
     print(f"run_id: {data['run_id']}")
     print(f"elapsed: {elapsed:.2f}s")
-    _auto_compare(args.log_dir)
+    _auto_compare(args.log_dir, impl)
 
 
 def cmd_list(args):
     if not os.path.isdir(args.log_dir):
         print("no logs")
         return
+    impl = _current_bench_impl(args)
     entries = []
     for name in os.listdir(args.log_dir):
         if not name.endswith(".json"):
@@ -892,6 +910,8 @@ def cmd_list(args):
         try:
             data = _load_run(path)
             kind = _classify_run(data)
+            if _bench_impl_of(data) != impl:
+                continue
             entries.append((data.get("timestamp_utc"), data.get("run_id"), kind, path))
         except json.JSONDecodeError:
             continue
@@ -910,6 +930,10 @@ def cmd_compare(args):
         sys.exit(1)
     a = _load_run(a_path)
     b = _load_run(b_path)
+    impl = _current_bench_impl(args)
+    if _bench_impl_of(a) != impl or _bench_impl_of(b) != impl:
+        print(f"compare requires bench_impl={impl} logs; re-run with matching implementation")
+        sys.exit(1)
     report = _build_report(a, b)
     _print_human_report(report)
     name_hint = f"compare_{a.get('run_id')}_{b.get('run_id')}"
@@ -927,6 +951,7 @@ def cmd_prune_logs(args):
     if not os.path.isdir(args.log_dir):
         print("no logs")
         return
+    impl = _current_bench_impl(args)
     entries = []
     for name in os.listdir(args.log_dir):
         if not name.endswith(".json"):
@@ -935,6 +960,8 @@ def cmd_prune_logs(args):
         try:
             data = _load_run(path)
         except json.JSONDecodeError:
+            continue
+        if _bench_impl_of(data) != impl:
             continue
         kind = _classify_run(data) or "unknown"
         entries.append((kind, data, path))
@@ -995,11 +1022,13 @@ def build_parser():
     run.set_defaults(func=cmd_run)
 
     lst = sub.add_parser("list", help="List existing runs")
+    lst.add_argument("--no-cython", action="store_true", help="List pure-Python runs (even if Cython is available)")
     lst.set_defaults(func=cmd_list)
 
     cmp = sub.add_parser("compare", help="Compare two runs by run_id or path")
     cmp.add_argument("baseline", help="Baseline run_id or JSON path")
     cmp.add_argument("comparison", help="Comparison run_id or JSON path")
+    cmp.add_argument("--no-cython", action="store_true", help="Compare pure-Python runs (even if Cython is available)")
     cmp.set_defaults(func=cmd_compare)
 
     prune = sub.add_parser(
@@ -1018,6 +1047,7 @@ def build_parser():
     prune.add_argument("--min-runs", type=int, default=4)
     prune.add_argument("--include-unknown", action="store_true", help="Also prune runs with unknown kernel kind")
     prune.add_argument("--apply", action="store_true", help="Actually remove outlier logs (default: dry run)")
+    prune.add_argument("--no-cython", action="store_true", help="Prune pure-Python runs (even if Cython is available)")
     prune.set_defaults(func=cmd_prune_logs)
 
     return p

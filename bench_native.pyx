@@ -35,6 +35,24 @@ cdef extern from "time.h":
 cdef extern from "sys/wait.h":
     int waitpid(int pid, int *status, int options)
 
+cdef extern from "pthread.h" nogil:
+    ctypedef struct pthread_t:
+        pass
+    ctypedef struct pthread_mutex_t:
+        pass
+    ctypedef struct pthread_cond_t:
+        pass
+    int pthread_create(pthread_t *thread, void *attr, void *(*start_routine)(void *) noexcept, void *arg)
+    int pthread_join(pthread_t thread, void **retval)
+    int pthread_mutex_init(pthread_mutex_t *mutex, void *attr)
+    int pthread_mutex_destroy(pthread_mutex_t *mutex)
+    int pthread_mutex_lock(pthread_mutex_t *mutex)
+    int pthread_mutex_unlock(pthread_mutex_t *mutex)
+    int pthread_cond_init(pthread_cond_t *cond, void *attr)
+    int pthread_cond_destroy(pthread_cond_t *cond)
+    int pthread_cond_wait(pthread_cond_t *cond, pthread_mutex_t *mutex)
+    int pthread_cond_signal(pthread_cond_t *cond)
+
 cdef extern from "sys/mman.h":
     void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
     int munmap(void *addr, size_t length)
@@ -188,4 +206,70 @@ def file_io(int mb):
     free(buf)
     close(fd)
     unlink(templ)
+    return t0
+
+
+cdef struct pingpong_state:
+    pthread_mutex_t mutex
+    pthread_cond_t cond_main
+    pthread_cond_t cond_worker
+    int turn
+    int stop
+
+
+cdef void* _pingpong_worker(void *arg) noexcept nogil:
+    cdef pingpong_state *st = <pingpong_state *>arg
+    while True:
+        pthread_mutex_lock(&st.mutex)
+        while st.turn == 0 and st.stop == 0:
+            pthread_cond_wait(&st.cond_worker, &st.mutex)
+        if st.stop != 0:
+            pthread_mutex_unlock(&st.mutex)
+            break
+        st.turn = 0
+        pthread_cond_signal(&st.cond_main)
+        pthread_mutex_unlock(&st.mutex)
+    return NULL
+
+
+def thread_pingpong(int n):
+    cdef pingpong_state st
+    cdef pthread_t thr
+    cdef int i
+    cdef double t0
+    st.turn = 0
+    st.stop = 0
+    if pthread_mutex_init(&st.mutex, <void *>0) != 0:
+        return -1.0
+    if pthread_cond_init(&st.cond_main, <void *>0) != 0:
+        pthread_mutex_destroy(&st.mutex)
+        return -1.0
+    if pthread_cond_init(&st.cond_worker, <void *>0) != 0:
+        pthread_cond_destroy(&st.cond_main)
+        pthread_mutex_destroy(&st.mutex)
+        return -1.0
+    if pthread_create(&thr, <void *>0, _pingpong_worker, <void *>&st) != 0:
+        pthread_cond_destroy(&st.cond_worker)
+        pthread_cond_destroy(&st.cond_main)
+        pthread_mutex_destroy(&st.mutex)
+        return -1.0
+
+    t0 = _now()
+    for i in range(n):
+        pthread_mutex_lock(&st.mutex)
+        st.turn = 1
+        pthread_cond_signal(&st.cond_worker)
+        while st.turn == 1:
+            pthread_cond_wait(&st.cond_main, &st.mutex)
+        pthread_mutex_unlock(&st.mutex)
+    t0 = _now() - t0
+
+    pthread_mutex_lock(&st.mutex)
+    st.stop = 1
+    pthread_cond_signal(&st.cond_worker)
+    pthread_mutex_unlock(&st.mutex)
+    pthread_join(thr, <void **>0)
+    pthread_cond_destroy(&st.cond_worker)
+    pthread_cond_destroy(&st.cond_main)
+    pthread_mutex_destroy(&st.mutex)
     return t0
