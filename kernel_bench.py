@@ -224,6 +224,9 @@ def bench_stat_loop(n=400_000):
 
 
 def bench_fork_exec(n=400):
+    if _bench_native:
+        return _timeit(lambda: _bench_native.fork_exec(n), iters=5)
+
     def run():
         for _ in range(n):
             subprocess.run(["/bin/true"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -266,6 +269,9 @@ def bench_thread_pingpong(n=250_000):
 
 
 def bench_mmap_touch(mb=64):
+    if _bench_native:
+        return _timeit(lambda: _bench_native.mmap_touch(mb), iters=3)
+
     import mmap
 
     size = mb * 1024 * 1024
@@ -283,6 +289,9 @@ def bench_mmap_touch(mb=64):
 
 
 def bench_file_io(mb=64):
+    if _bench_native:
+        return _timeit(lambda: _bench_native.file_io(mb), iters=3)
+
     size = mb * 1024 * 1024
     data = os.urandom(1024 * 1024)
 
