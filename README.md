@@ -6,7 +6,7 @@ Lightweight kernel performance probe with an opinionated workflow: collect runs,
 - JSON run logs, plus human-readable summaries
 - Auto-compare of normal vs hardened runs
 - Outlier detection and pruning (dry-run by default)
-- Cython-powered benchmarks with a pure‑Python fallback
+- Cython-powered benchmarks
 
 ## Quick start
 
@@ -20,17 +20,12 @@ That builds the Cython extension (if needed) and runs the suite.
 
 Run a full suite:
 ```bash
-./run.sh run
+./run.sh
 ```
 
 Run a single benchmark:
 ```bash
-./run.sh run --only syscall_loop
-```
-
-Force the pure‑Python path (no Cython):
-```bash
-./run.sh run --no-cython
+./run.sh --only syscall_loop
 ```
 
 Compare two runs by id/path:
@@ -73,7 +68,7 @@ The following benchmarks run in Cython when the extension is built:
 - `file_io`
 - `thread_pingpong`
 
-If the extension can’t be imported, the runner falls back to Python automatically.
+The Cython extension is required to run benchmarks.
 
 To build manually:
 ```bash

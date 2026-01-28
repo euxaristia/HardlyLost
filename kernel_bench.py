@@ -1,16 +1,11 @@
 #!/usr/bin/env python3
 import argparse
-import ctypes
-import errno
 import gzip
 import json
 import os
 import platform
 import random
-import shutil
 import statistics
-import struct
-import subprocess
 import sys
 import tempfile
 import time
@@ -57,10 +52,8 @@ def _read_kernel_config():
     return None
 
 
-def _current_bench_impl(args=None):
-    if args is not None and getattr(args, "no_cython", False):
-        return "python"
-    return "cython" if _bench_native else "python"
+def _current_bench_impl(_args=None):
+    return "cython"
 
 
 def _bench_impl_of(data):
@@ -200,18 +193,10 @@ def _bench_skip(reason):
     return {"skipped": reason}
 
 
-def _libc():
-    return ctypes.CDLL("libc.so.6", use_errno=True)
-
-
 def bench_syscall_loop(n=1_500_000):
-    if _bench_native:
-        return _timeit(lambda: _bench_native.syscall_loop(n), iters=5, progress_label="syscall_loop")
-
-    def run():
-        for _ in range(n):
-            os.getpid()
-    return _timeit(run, iters=5, progress_label="syscall_loop")
+    if not _bench_native:
+        raise RuntimeError("bench_native is required (build with setup.py)")
+    return _timeit(lambda: _bench_native.syscall_loop(n), iters=5, progress_label="syscall_loop")
 
 
 def bench_stat_loop(n=400_000):
@@ -219,108 +204,39 @@ def bench_stat_loop(n=400_000):
     path = tmp.name
     tmp.close()
 
-    if _bench_native:
-        path_bytes = path.encode()
+    if not _bench_native:
+        raise RuntimeError("bench_native is required (build with setup.py)")
+    path_bytes = path.encode()
 
-        def run():
-            return _bench_native.stat_loop(path_bytes, n)
-    else:
-        def run():
-            for _ in range(n):
-                os.stat(path)
+    def run():
+        return _bench_native.stat_loop(path_bytes, n)
     result = _timeit(run, iters=5, progress_label="stat_loop")
     os.unlink(path)
     return result
 
 
 def bench_fork_exec(n=400):
-    if _bench_native:
-        return _timeit(lambda: _bench_native.fork_exec(n), iters=5, progress_label="fork_exec")
-
-    def run():
-        for _ in range(n):
-            subprocess.run(["/bin/true"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return _timeit(run, iters=5, progress_label="fork_exec")
+    if not _bench_native:
+        raise RuntimeError("bench_native is required (build with setup.py)")
+    return _timeit(lambda: _bench_native.fork_exec(n), iters=5, progress_label="fork_exec")
 
 
 def bench_thread_pingpong(n=250_000):
-    import threading
-
-    if _bench_native:
-        return _timeit(lambda: _bench_native.thread_pingpong(n), iters=5, progress_label="thread_pingpong")
-
-    e1 = threading.Event()
-    e2 = threading.Event()
-    stop = threading.Event()
-    e1.set()
-
-    def worker():
-        while not stop.is_set():
-            if not e2.wait(0.1):
-                continue
-            e2.clear()
-            if stop.is_set():
-                break
-            e1.set()
-
-    t = threading.Thread(target=worker)
-    t.start()
-
-    def run():
-        for _ in range(n):
-            e1.wait()
-            e1.clear()
-            e2.set()
-    try:
-        result = _timeit(run, iters=5, progress_label="thread_pingpong")
-    finally:
-        stop.set()
-        e2.set()
-        e1.set()
-        t.join(timeout=1)
-    return result
+    if not _bench_native:
+        raise RuntimeError("bench_native is required (build with setup.py)")
+    return _timeit(lambda: _bench_native.thread_pingpong(n), iters=5, progress_label="thread_pingpong")
 
 
 def bench_mmap_touch(mb=64):
-    if _bench_native:
-        return _timeit(lambda: _bench_native.mmap_touch(mb), iters=3, progress_label="mmap_touch")
-
-    import mmap
-
-    size = mb * 1024 * 1024
-    with tempfile.TemporaryFile() as f:
-        f.truncate(size)
-        mm = mmap.mmap(f.fileno(), size, access=mmap.ACCESS_WRITE)
-
-        def run():
-            step = 4096
-            for i in range(0, size, step):
-                mm[i:i+1] = b"\x01"
-        result = _timeit(run, iters=3, progress_label="mmap_touch")
-        mm.close()
-    return result
+    if not _bench_native:
+        raise RuntimeError("bench_native is required (build with setup.py)")
+    return _timeit(lambda: _bench_native.mmap_touch(mb), iters=3, progress_label="mmap_touch")
 
 
 def bench_file_io(mb=64):
-    if _bench_native:
-        return _timeit(lambda: _bench_native.file_io(mb), iters=3, progress_label="file_io")
-
-    size = mb * 1024 * 1024
-    data = os.urandom(1024 * 1024)
-
-    def run():
-        with tempfile.NamedTemporaryFile(delete=False) as f:
-            remaining = size
-            while remaining > 0:
-                f.write(data)
-                remaining -= len(data)
-            fname = f.name
-        with open(fname, "rb") as f:
-            while f.read(1024 * 1024):
-                pass
-        os.unlink(fname)
-
-    return _timeit(run, iters=3, progress_label="file_io")
+    if not _bench_native:
+        raise RuntimeError("bench_native is required (build with setup.py)")
+    return _timeit(lambda: _bench_native.file_io(mb), iters=3, progress_label="file_io")
 
 
 def run_benchmarks(args):
@@ -866,9 +782,6 @@ def _auto_compare(log_dir, impl):
 
 
 def cmd_run(args):
-    global _bench_native
-    if args.no_cython:
-        _bench_native = None
     impl = _current_bench_impl(args)
     start = time.monotonic()
     kernel_info = collect_kernel_info()
@@ -1018,17 +931,14 @@ def build_parser():
     run.add_argument("--io-mb", type=int, default=64)
     run.add_argument("--repeat", type=int, default=3, help="Repeat full suite and median-aggregate")
     run.add_argument("--only", nargs="+", help="Run only specific benchmarks")
-    run.add_argument("--no-cython", action="store_true", help="Force pure-Python benchmarks")
     run.set_defaults(func=cmd_run)
 
     lst = sub.add_parser("list", help="List existing runs")
-    lst.add_argument("--no-cython", action="store_true", help="List pure-Python runs (even if Cython is available)")
     lst.set_defaults(func=cmd_list)
 
     cmp = sub.add_parser("compare", help="Compare two runs by run_id or path")
     cmp.add_argument("baseline", help="Baseline run_id or JSON path")
     cmp.add_argument("comparison", help="Comparison run_id or JSON path")
-    cmp.add_argument("--no-cython", action="store_true", help="Compare pure-Python runs (even if Cython is available)")
     cmp.set_defaults(func=cmd_compare)
 
     prune = sub.add_parser(
@@ -1047,7 +957,6 @@ def build_parser():
     prune.add_argument("--min-runs", type=int, default=4)
     prune.add_argument("--include-unknown", action="store_true", help="Also prune runs with unknown kernel kind")
     prune.add_argument("--apply", action="store_true", help="Actually remove outlier logs (default: dry run)")
-    prune.add_argument("--no-cython", action="store_true", help="Prune pure-Python runs (even if Cython is available)")
     prune.set_defaults(func=cmd_prune_logs)
 
     return p
