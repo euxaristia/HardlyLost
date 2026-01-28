@@ -256,14 +256,14 @@ def _seccomp_child_syscall_loop(n):
     return struct.unpack("d", data)[0]
 
 
-def bench_syscall_loop(n=1_000_000):
+def bench_syscall_loop(n=1_500_000):
     def run():
         for _ in range(n):
             os.getpid()
-    return _timeit(run, iters=3)
+    return _timeit(run, iters=5)
 
 
-def bench_stat_loop(n=300_000):
+def bench_stat_loop(n=400_000):
     tmp = tempfile.NamedTemporaryFile(delete=False)
     path = tmp.name
     tmp.close()
@@ -271,19 +271,19 @@ def bench_stat_loop(n=300_000):
     def run():
         for _ in range(n):
             os.stat(path)
-    result = _timeit(run, iters=3)
+    result = _timeit(run, iters=5)
     os.unlink(path)
     return result
 
 
-def bench_fork_exec(n=300):
+def bench_fork_exec(n=400):
     def run():
         for _ in range(n):
             subprocess.run(["/bin/true"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return _timeit(run, iters=3)
+    return _timeit(run, iters=5)
 
 
-def bench_thread_pingpong(n=200_000):
+def bench_thread_pingpong(n=250_000):
     import threading
 
     e1 = threading.Event()
@@ -309,7 +309,7 @@ def bench_thread_pingpong(n=200_000):
             e1.clear()
             e2.set()
     try:
-        result = _timeit(run, iters=3, progress_label="thread_pingpong")
+        result = _timeit(run, iters=5, progress_label="thread_pingpong")
     finally:
         stop.set()
         e2.set()
@@ -330,7 +330,7 @@ def bench_mmap_touch(mb=64):
             step = 4096
             for i in range(0, size, step):
                 mm[i:i+1] = b"\x01"
-        result = _timeit(run, iters=2)
+        result = _timeit(run, iters=3)
         mm.close()
     return result
 
@@ -351,7 +351,7 @@ def bench_file_io(mb=64):
                 pass
         os.unlink(fname)
 
-    return _timeit(run, iters=2)
+    return _timeit(run, iters=3)
 
 
 def run_benchmarks(args):
@@ -367,11 +367,21 @@ def run_benchmarks(args):
     if args.only:
         benches = {k: v for k, v in benches.items() if k in args.only}
 
-    results = {}
-    for name, fn in benches.items():
-        results[name] = fn()
+    def run_once():
+        out = {}
+        for name, fn in benches.items():
+            out[name] = fn()
+        return out
 
-    return results
+    if args.repeat <= 1:
+        return run_once()
+
+    runs = []
+    for i in range(args.repeat):
+        if args.repeat > 1:
+            print(f"[suite] run {i + 1}/{args.repeat}...", file=sys.stderr, flush=True)
+        runs.append(run_once())
+    return runs
 
 
 def _run_id():
@@ -424,13 +434,49 @@ def _compare_runs(a, b):
     return out
 
 
+def _merge_benchmark_entries(entries):
+    vals = [e.get("p50_s") for e in entries if e and e.get("p50_s") is not None]
+    entry = {}
+    if vals:
+        entry["p50_s"] = statistics.median(vals)
+    skipped = [e.get("skipped") for e in entries if e and e.get("skipped")]
+    if skipped:
+        entry["skipped"] = skipped[0]
+    return entry
+
+
+def _normalize_benchmarks(benchmarks):
+    if not benchmarks:
+        return {}
+    if isinstance(benchmarks, dict):
+        return benchmarks
+    if isinstance(benchmarks, list):
+        merged = {}
+        names = set()
+        for run in benchmarks:
+            if isinstance(run, dict):
+                names.update(run.keys())
+        for name in names:
+            entries = []
+            for run in benchmarks:
+                if isinstance(run, dict):
+                    entries.append(run.get(name))
+            merged[name] = _merge_benchmark_entries(entries)
+        return merged
+    return {}
+
+
 def _build_report(a, b):
-    report = _compare_runs(a, b)
+    a_bench = _normalize_benchmarks(a.get("benchmarks"))
+    b_bench = _normalize_benchmarks(b.get("benchmarks"))
+    report = _compare_runs({"benchmarks": a_bench}, {"benchmarks": b_bench})
     report["summary"] = {
         "baseline_run_id": a.get("run_id"),
         "comparison_run_id": b.get("run_id"),
         "baseline_kernel": (a.get("kernel") or {}).get("kernel_release"),
         "comparison_kernel": (b.get("kernel") or {}).get("kernel_release"),
+        "baseline_repeat": a.get("bench_repeat"),
+        "comparison_repeat": b.get("bench_repeat"),
         "generated_utc": datetime.now(timezone.utc).isoformat(),
     }
     return report
@@ -439,7 +485,8 @@ def _build_report(a, b):
 def _aggregate_runs(runs):
     benches = {}
     for data in runs:
-        for name, entry in (data.get("benchmarks") or {}).items():
+        normalized = _normalize_benchmarks(data.get("benchmarks"))
+        for name, entry in normalized.items():
             benches.setdefault(name, []).append(entry)
 
     out = {}
@@ -701,6 +748,7 @@ def cmd_run(args):
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "kernel": kernel_info,
         "benchmarks": benchmarks,
+        "bench_repeat": args.repeat,
         "bench_config": {
             "syscall_iters": args.syscall_iters,
             "stat_iters": args.stat_iters,
@@ -767,12 +815,13 @@ def build_parser():
     sub = p.add_subparsers(dest="cmd", required=True)
 
     run = sub.add_parser("run", help="Run benchmarks and record kernel info")
-    run.add_argument("--syscall-iters", type=int, default=1_000_000)
-    run.add_argument("--stat-iters", type=int, default=300_000)
-    run.add_argument("--fork-iters", type=int, default=300)
-    run.add_argument("--pingpong-iters", type=int, default=200_000)
+    run.add_argument("--syscall-iters", type=int, default=1_500_000)
+    run.add_argument("--stat-iters", type=int, default=400_000)
+    run.add_argument("--fork-iters", type=int, default=400)
+    run.add_argument("--pingpong-iters", type=int, default=250_000)
     run.add_argument("--mmap-mb", type=int, default=64)
     run.add_argument("--io-mb", type=int, default=64)
+    run.add_argument("--repeat", type=int, default=3, help="Repeat full suite and median-aggregate")
     run.add_argument("--only", nargs="+", help="Run only specific benchmarks")
     run.set_defaults(func=cmd_run)
 
