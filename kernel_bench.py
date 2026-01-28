@@ -12,6 +12,11 @@ import time
 from datetime import datetime, timezone
 
 try:
+    import orjson as _orjson
+except Exception:
+    _orjson = None
+
+try:
     import bench_native as _bench_native
 except Exception:
     _bench_native = None
@@ -168,16 +173,18 @@ def _score_hardening(info):
 
 def _timeit(fn, iters=1, progress_label=None):
     samples = []
+    append = samples.append
+    perf = time.perf_counter
     for i in range(iters):
         if progress_label:
             print(f"[{progress_label}] sample {i + 1}/{iters}...", file=sys.stderr, flush=True)
-        t0 = time.perf_counter()
+        t0 = perf()
         ret = fn()
-        t1 = time.perf_counter()
+        t1 = perf()
         if isinstance(ret, (int, float)) and ret >= 0:
-            samples.append(float(ret))
+            append(float(ret))
         else:
-            samples.append(t1 - t0)
+            append(t1 - t0)
         if progress_label:
             print(f"[{progress_label}] sample {i + 1}/{iters} done", file=sys.stderr, flush=True)
     return {
@@ -187,6 +194,23 @@ def _timeit(fn, iters=1, progress_label=None):
         "max_s": max(samples),
         "samples": samples,
     }
+
+
+def _json_dump(data, fp):
+    if _orjson:
+        payload = _orjson.dumps(data, option=_orjson.OPT_INDENT_2 | _orjson.OPT_SORT_KEYS)
+        if hasattr(fp, "buffer"):
+            fp.buffer.write(payload)
+        else:
+            fp.write(payload)
+        return
+    json.dump(data, fp, indent=2, sort_keys=True)
+
+
+def _json_load(fp):
+    if _orjson:
+        return _orjson.loads(fp.read())
+    return json.load(fp)
 
 
 def _bench_skip(reason):
@@ -278,13 +302,13 @@ def _write_json_log(data, log_dir):
     os.makedirs(log_dir, exist_ok=True)
     path = os.path.join(log_dir, f"{data['run_id']}.json")
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, sort_keys=True)
+        _json_dump(data, f)
     return path
 
 
 def _load_run(path):
     with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+        return _json_load(f)
 
 
 def _find_run(log_dir, run_id):
@@ -578,7 +602,7 @@ def _write_report_json(report, data_store_dir, name_hint):
     path = os.path.join(data_store_dir, f"{name_hint}.json")
     try:
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(report, f, indent=2, sort_keys=True)
+            _json_dump(report, f)
     except OSError as exc:
         return None, f"write failed: {exc}"
     return path, None
