@@ -98,4 +98,4 @@ python3 kernel_bench.py prune --z-thresh 2.5 --min-benchmarks 3 --min-runs 4
 
 ## License
 
-MIT (add a LICENSE file if you want it explicit).
+GPL-3.0 (see the [LICENSE](LICENSE) file for details).
