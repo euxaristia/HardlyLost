@@ -3,6 +3,12 @@ import Foundation
 import Glibc
 #endif
 
+// We need a small wrapper for zlib to decompress /proc/config.gz
+// We'll declare the C functions directly to avoid a complicated package structure.
+@_silgen_name("gzopen") func gzopen(_ path: UnsafePointer<CChar>, _ mode: UnsafePointer<CChar>) -> UnsafeMutableRawPointer?
+@_silgen_name("gzread") func gzread(_ file: UnsafeMutableRawPointer, _ buf: UnsafeMutableRawPointer, _ len: UInt32) -> Int32
+@_silgen_name("gzclose") func gzclose(_ file: UnsafeMutableRawPointer) -> Int32
+
 enum KernelInfoCollector {
     static func collect() -> KernelInfo {
         var uts = utsname()
@@ -19,7 +25,7 @@ enum KernelInfoCollector {
             lockdown: readFile("/sys/kernel/security/lockdown"),
             vulnerabilities: collectVulnerabilities(),
             config: collectConfig(),
-            hardening_indicators: .init(score: 0, indicators: []) // Placeholder, will update
+            hardening_indicators: .init(score: 0, indicators: [])
         )
         
         var finalInfo = info
@@ -29,6 +35,24 @@ enum KernelInfoCollector {
 
     private static func readFile(_ path: String) -> String? {
         try? String(contentsOfFile: path, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func readGzipFile(_ path: String) -> String? {
+        guard let file = gzopen(path, "rb") else { return nil }
+        defer { gzclose(file) }
+        
+        var data = Data()
+        let bufferSize = 1024 * 16
+        let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: bufferSize)
+        defer { buffer.deallocate() }
+        
+        while true {
+            let read = gzread(file, buffer, UInt32(bufferSize))
+            if read <= 0 { break }
+            data.append(buffer, count: Int(read))
+        }
+        
+        return String(data: data, encoding: .utf8)
     }
 
     private static func collectSysctls() -> [String: String?] {
@@ -52,24 +76,28 @@ enum KernelInfoCollector {
     }
 
     private static func collectConfig() -> [String: Bool?] {
-        let kernelRelease = withUnsafePointer(to: utsname().release) { $0.withMemoryRebound(to: CChar.self, capacity: 65) { String(cString: $0) } }
-        let paths = ["/proc/config.gz", "/boot/config-\(kernelRelease)"]
-        
-        for path in paths {
-            if FileManager.default.fileExists(atPath: path), !path.hasSuffix(".gz") {
-                if let content = try? String(contentsOfFile: path, encoding: .utf8) {
-                    return parseConfig(content)
-                }
-            }
+        if let content = readGzipFile("/proc/config.gz") {
+            return parseConfig(content)
         }
+        
+        let kernelRelease = withUnsafePointer(to: utsname().release) { $0.withMemoryRebound(to: CChar.self, capacity: 65) { String(cString: $0) } }
+        let bootConfigPath = "/boot/config-\(kernelRelease)"
+        if let content = readFile(bootConfigPath) {
+            return parseConfig(content)
+        }
+        
         return [:]
     }
 
     private static func parseConfig(_ content: String) -> [String: Bool?] {
         let keys = [
-            "CONFIG_HARDENED_USERCOPY", "CONFIG_STACKPROTECTOR_STRONG", "CONFIG_FORTIFY_SOURCE",
-            "CONFIG_SLAB_FREELIST_HARDENED", "CONFIG_SLAB_FREELIST_RANDOM", "CONFIG_RANDOMIZE_BASE",
-            "CONFIG_PAGE_TABLE_ISOLATION", "CONFIG_RETPOLINE"
+            "CONFIG_HARDENED_USERCOPY", "CONFIG_HARDENED_USERCOPY_FALLBACK",
+            "CONFIG_STACKPROTECTOR", "CONFIG_STACKPROTECTOR_STRONG",
+            "CONFIG_FORTIFY_SOURCE", "CONFIG_SLAB_FREELIST_HARDENED",
+            "CONFIG_SLAB_FREELIST_RANDOM", "CONFIG_GCC_PLUGIN_RANDSTRUCT",
+            "CONFIG_GCC_PLUGIN_LATENT_ENTROPY", "CONFIG_RANDOMIZE_BASE",
+            "CONFIG_SHUFFLE_PAGE_ALLOCATOR", "CONFIG_PAGE_TABLE_ISOLATION",
+            "CONFIG_RETPOLINE", "CONFIG_ARM64_PTR_AUTH"
         ]
         var result: [String: Bool?] = [:]
         for key in keys {

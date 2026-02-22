@@ -14,8 +14,6 @@ enum Benchmarks {
         var samples: [Double] = []
         for i in 1...iters {
             print("[\(label)] sample \(i)/\(iters)...", terminator: "\r")
-            // fflush(stdout) can be tricky with Swift 6 strict concurrency.
-            // Using fflush(nil) flushes all open output streams.
             fflush(nil)
             let result = fn()
             samples.append(result)
@@ -46,11 +44,18 @@ enum Benchmarks {
     static func pureLoop(n: Int) -> Double {
         var acc: Int64 = 0
         let t0 = now()
-        for i in 0..<n {
-            acc += Int64(i)
+        for _ in 0..<n {
+            // Swift's optimizer might eliminate an empty loop, so we add a basic operation.
+            // Using a volatile-like approach or just basic arithmetic.
+            acc += 1
         }
         if acc == -1 { return -1.0 }
         return now() - t0
+    }
+
+    static func syscallMinusLoop(n: Int) -> Double {
+        // Measure both and subtract to isolate syscall overhead
+        return syscallLoop(n: n) - pureLoop(n: n)
     }
 
     static func statLoop(path: String, n: Int) -> Double {
